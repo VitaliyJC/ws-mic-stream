@@ -21,117 +21,166 @@
 <p>Буфер: <span id="buf">0</span> фреймов</p>
 
 <script>
-  const wsScheme = location.protocol === "https:" ? "wss" : "ws";
-  const WS_URL = `${wsScheme}://${location.host}/listen`;
   const SAMPLE_RATE = 16000;
   const FRAME_SAMPLES = 320; // 20 ms
-  const START_BUFFER_FRAMES = 6; // ~120 ms перед стартом
+  const START_BUFFER_FRAMES = 6; // ~120 ms
+  const wsScheme = location.protocol === "https:" ? "wss" : "ws";
+  const WS_URL = `${wsScheme}://${location.host}/listen`;
 
-  let ctx, node, ws;
-  let queued = 0;
+  let ctx,
+    ws,
+    queued = 0;
+
+  // Кольцевой буфер для обоих путей (Worklet/ScriptProcessor)
+  const RING_FRAMES = 200; // ~4s
+  const ring = new Int16Array(FRAME_SAMPLES * RING_FRAMES);
+  let rd = 0,
+    wr = 0,
+    ringLen = ring.length;
+
+  function pushPCM(int16Array) {
+    for (let i = 0; i < int16Array.length; i++) {
+      ring[wr] = int16Array[i];
+      wr = (wr + 1) % ringLen;
+      if (wr === rd) rd = (rd + FRAME_SAMPLES) % ringLen; // предотвращаем переполнение
+    }
+  }
+
+  function availableFrames() {
+    return ((wr - rd + ringLen) % ringLen) / FRAME_SAMPLES;
+  }
+
+  function status(txt, ok) {
+    const el = document.getElementById("status");
+    el.textContent = txt;
+    el.className = ok ? "ok" : "bad";
+  }
 
   async function start() {
     if (!ctx) {
       ctx = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: SAMPLE_RATE,
       });
-      const workletCode = `
-    class PCMPlayer extends AudioWorkletProcessor {
-      constructor(options){
-        super();
-        this.buf = new Int16Array( FRAME_SAMPLES * 200 ); // ~4s запас по 20мс
-        this.rd = 0; this.wr = 0; this.len = this.buf.length;
-        this.ready = false;
-        this.started = false;
-        this.port.onmessage = (e)=>{
-          if (e.data && e.data.type === 'push'){
-            const view = new Int16Array(e.data.payload);
-            for (let i=0;i<view.length;i++){
-              this.buf[this.wr] = view[i];
-              this.wr = (this.wr + 1) % this.len;
-              if (this.wr === this.rd) { // переполнение — подвинем чтение
-                this.rd = (this.rd + FRAME_SAMPLES) % this.len;
+    }
+
+    // === Попытка AudioWorklet ===
+    if (ctx.audioWorklet) {
+      try {
+        const code = `
+        class PCMPlayer extends AudioWorkletProcessor {
+          constructor(){
+            super();
+            this.FRAME = ${FRAME_SAMPLES};
+            this.len = this.FRAME * ${RING_FRAMES};
+            this.buf = new Int16Array(this.len);
+            this.rd=0; this.wr=0;
+            this.started=false;
+            this.startFrames=${START_BUFFER_FRAMES};
+            this.port.onmessage = (e)=>{
+              if (e.data && e.data.type==='push'){
+                const v = new Int16Array(e.data.payload);
+                for (let i=0;i<v.length;i++){
+                  this.buf[this.wr]=v[i];
+                  this.wr=(this.wr+1)%this.len;
+                  if (this.wr===this.rd) this.rd=(this.rd+this.FRAME)%this.len;
+                }
+              }
+            };
+          }
+          avail(){ return (this.wr - this.rd + this.len) % this.len / this.FRAME; }
+          process(_, outputs){
+            const out = outputs[0][0];
+            if (!this.started && this.avail() >= this.startFrames) this.started = true;
+            for (let i=0;i<out.length;i++){
+              if (!this.started || this.rd===this.wr) out[i]=0;
+              else {
+                const s16 = this.buf[this.rd];
+                this.rd = (this.rd + 1) % this.len;
+                out[i] = Math.max(-1, Math.min(1, s16 / 32768));
               }
             }
-          } else if (e.data && e.data.type === 'startWhen') {
-            this.ready = true;
-            this.startThreshold = e.data.frames;
+            return true;
           }
         }
-      }
-      availableFrames(){
-        return (this.wr - this.rd + this.len) % this.len / FRAME_SAMPLES;
-      }
-      process(inputs, outputs, parameters){
-        const out = outputs[0][0];
-        if (this.ready && !this.started){
-          if (this.availableFrames() >= this.startThreshold) this.started = true;
-        }
-        if (!this.started){
-          // тишина до накопления буфера
-          out.fill(0);
-          return true;
-        }
-        // читаем 128 float32 семплов на тик
-        for (let i=0;i<out.length;i++){
-          if (this.rd === this.wr){
-            out[i] = 0; // underrun
-          } else {
-            const s16 = this.buf[this.rd];
-            this.rd = (this.rd + 1) % this.len;
-            out[i] = Math.max(-1, Math.min(1, s16 / 32768));
-          }
-        }
-        return true;
+        registerProcessor('pcm-player', PCMPlayer);
+      `;
+        const blob = new Blob([code], { type: "application/javascript" });
+        await ctx.audioWorklet.addModule(URL.createObjectURL(blob));
+        const node = new AudioWorkletNode(ctx, "pcm-player", {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [1],
+        });
+        node.connect(ctx.destination);
+
+        // подключаем WS ТОЛЬКО после готовности узла
+        await openWS(async (buf) => {
+          node.port.postMessage({ type: "push", payload: buf }, [buf]);
+        });
+
+        await ctx.resume();
+        status(
+          `AudioContext: ${ctx.state} @ ${ctx.sampleRate} Hz (worklet)`,
+          true
+        );
+        return;
+      } catch (e) {
+        console.warn("AudioWorklet failed, fallback to ScriptProcessor", e);
       }
     }
-    registerProcessor('pcm-player', PCMPlayer);
-    `;
-      const blob = new Blob(
-        [`const FRAME_SAMPLES=${FRAME_SAMPLES};\n` + workletCode],
-        { type: "application/javascript" }
-      );
-      await ctx.audioWorklet.addModule(URL.createObjectURL(blob));
 
-      node = new AudioWorkletNode(ctx, "pcm-player", {
-        numberOfInputs: 0,
-        numberOfOutputs: 1,
-        outputChannelCount: [1],
-      });
-      node.connect(ctx.destination);
-      node.port.postMessage({ type: "startWhen", frames: START_BUFFER_FRAMES });
-    }
+    // === Фоллбек: ScriptProcessorNode ===
+    const proc = ctx.createScriptProcessor(1024, 0, 1);
+    let started = false;
+    proc.onaudioprocess = (ev) => {
+      const out = ev.outputBuffer.getChannelData(0);
+      if (!started && availableFrames() >= START_BUFFER_FRAMES) started = true;
+      for (let i = 0; i < out.length; i++) {
+        if (!started || rd === wr) {
+          out[i] = 0;
+          continue;
+        }
+        const s16 = ring[rd];
+        rd = (rd + 1) % ringLen;
+        out[i] = Math.max(-1, Math.min(1, s16 / 32768));
+      }
+    };
+    proc.connect(ctx.destination);
 
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      const wsScheme = location.protocol === "https:" ? "wss" : "ws";
-      const WS_URL = `${wsScheme}://${location.host}/listen`;
+    await openWS(async (buf) => {
+      pushPCM(new Int16Array(buf));
+    });
 
+    await ctx.resume();
+    status(`AudioContext: ${ctx.state} @ ${ctx.sampleRate} Hz (script)`, true);
+  }
+
+  // Открытие WS + единая обработка «Blob или ArrayBuffer»
+  async function openWS(onFrame) {
+    return new Promise((resolve, reject) => {
+      if (window.ws && ws.readyState === WebSocket.OPEN) return resolve();
       ws = new WebSocket(WS_URL);
       ws.binaryType = "arraybuffer";
       ws.onopen = () => {
-        document.getElementById("status").textContent = "WS: connected";
-        document.getElementById("status").className = "ok";
+        status("WS: connected", true);
+        resolve();
       };
       ws.onclose = () => {
-        document.getElementById("status").textContent = "WS: closed";
-        document.getElementById("status").className = "bad";
+        status("WS: closed", false);
       };
+      ws.onerror = (e) => {
+        console.error("WS error", e);
+      };
+
+      let cnt = 0;
       ws.onmessage = async (ev) => {
-        if (!node) return;
         const buf =
           ev.data instanceof Blob ? await ev.data.arrayBuffer() : ev.data;
-        node.port.postMessage({ type: "push", payload: buf }, [buf]);
-        queued++;
-        document.getElementById("buf").textContent = queued;
-        if (queued > 20) queued = 10;
+        onFrame(buf);
+        document.getElementById("buf").textContent = ++cnt;
+        if (cnt > 20) cnt = 10;
       };
-    }
-
-    await ctx.resume();
-    document.getElementById(
-      "status"
-    ).textContent = `AudioContext: ${ctx.state} @ ${ctx.sampleRate} Hz`;
-    document.getElementById("status").className = "ok";
+    });
   }
 
   document.getElementById("play").onclick = start;

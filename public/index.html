@@ -103,6 +103,9 @@
     }
 
     if (!ws || ws.readyState !== WebSocket.OPEN) {
+      const wsScheme = location.protocol === "https:" ? "wss" : "ws";
+      const WS_URL = `${wsScheme}://${location.host}/listen`;
+
       ws = new WebSocket(WS_URL);
       ws.binaryType = "arraybuffer";
       ws.onopen = () => {
@@ -113,12 +116,13 @@
         document.getElementById("status").textContent = "WS: closed";
         document.getElementById("status").className = "bad";
       };
-      ws.onmessage = (ev) => {
-        // ожидаем ровно 320 * int16 (640 байт)
-        node.port.postMessage({ type: "push", payload: ev.data }, [ev.data]);
+      ws.onmessage = async (ev) => {
+        if (!node) return;
+        const buf =
+          ev.data instanceof Blob ? await ev.data.arrayBuffer() : ev.data;
+        node.port.postMessage({ type: "push", payload: buf }, [buf]);
         queued++;
         document.getElementById("buf").textContent = queued;
-        // слегка «подпускаем пар» у счётчика
         if (queued > 20) queued = 10;
       };
     }

@@ -6,8 +6,6 @@ services:
     container_name: mic-stream
     ports:
       - "8080:8080"
-      - "9001:9001"
     environment:
       HTTP_PORT: 8080
-      WS_PORT: 9001
     restart: unless-stopped

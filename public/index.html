@@ -21,7 +21,8 @@
 <p>Буфер: <span id="buf">0</span> фреймов</p>
 
 <script>
-  const WS_URL = `ws://192.168.0.161:9001/listen`;
+  const wsScheme = location.protocol === "https:" ? "wss" : "ws";
+  const WS_URL = `${wsScheme}://${location.host}/listen`;
   const SAMPLE_RATE = 16000;
   const FRAME_SAMPLES = 320; // 20 ms
   const START_BUFFER_FRAMES = 6; // ~120 ms перед стартом

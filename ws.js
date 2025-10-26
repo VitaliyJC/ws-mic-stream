@@ -1,4 +1,6 @@
+// ws.js
 import path from "path";
+import http from "http";
 import express from "express";
 import { WebSocketServer } from "ws";
 import { fileURLToPath } from "url";
@@ -6,43 +8,51 @@ import { fileURLToPath } from "url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const HTTP_PORT = 8080; // отдадим html
-const WS_PORT = 9001; // WS для стрима
+const PORT = process.env.PORT || 8080;
 
-// --- HTTP (статик) ---
 const app = express();
 app.use(express.static(path.join(__dirname, "public")));
-app.listen(HTTP_PORT, () => console.log("HTTP on :" + HTTP_PORT));
 
-// --- WS ---
-const wss = new WebSocketServer({ port: WS_PORT });
+const server = http.createServer(app);
+server.listen(PORT, () => console.log("HTTP+WS on :" + PORT));
+
+// два WS-эндпойнта на ОДНОМ порту
+const wssStream = new WebSocketServer({ noServer: true }); // /stream (ESP32 → сервер)
+const wssListen = new WebSocketServer({ noServer: true }); // /listen (сервер → браузеры)
+
 let listeners = new Set();
-let senders = new Set();
+let frames = 0;
 
-wss.on("connection", (ws, req) => {
-  const url = req.url || "/";
-  const isSender = url.startsWith("/stream");
-  if (isSender) {
-    senders.add(ws);
-    console.log("Sender connected");
-  } else {
-    listeners.add(ws);
-    console.log("Listener connected");
-  }
+wssListen.on("connection", (ws) => {
+  listeners.add(ws);
+  console.log("Listener connected");
+  ws.on("close", () => listeners.delete(ws));
+});
 
+wssStream.on("connection", (ws) => {
+  console.log("Sender connected");
   ws.on("message", (msg, isBinary) => {
-    if (!isSender || !isBinary) return;
-    // Рассылаем всем слушателям бинарный PCM-фрейм (20 мс)
+    // при необходимости можно проверять isBinary === true
+    frames++;
+    if (frames % 50 === 0) {
+      console.log(`relay: ${frames} frames, last ${msg.length} bytes`);
+    }
     for (const cli of listeners) {
       if (cli.readyState === 1) cli.send(msg, { binary: true });
     }
   });
-
-  ws.on("close", () => {
-    listeners.delete(ws);
-    senders.delete(ws);
-  });
 });
-console.log(
-  "WS on :" + WS_PORT + "  (ws://host:9001/stream  |  ws://host:9001/listen)"
-);
+
+server.on("upgrade", (req, socket, head) => {
+  if (req.url.startsWith("/stream")) {
+    wssStream.handleUpgrade(req, socket, head, (ws) =>
+      wssStream.emit("connection", ws, req)
+    );
+  } else if (req.url.startsWith("/listen")) {
+    wssListen.handleUpgrade(req, socket, head, (ws) =>
+      wssListen.emit("connection", ws, req)
+    );
+  } else {
+    socket.destroy();
+  }
+});

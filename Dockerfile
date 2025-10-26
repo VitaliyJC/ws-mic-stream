@@ -19,7 +19,6 @@ RUN adduser -D appuser && chown -R appuser:appuser /app
 USER appuser
 
 ENV HTTP_PORT=8080
-ENV WS_PORT=9001
 
-EXPOSE 8080 9001
+EXPOSE 8080
 CMD ["node","ws.js"]
